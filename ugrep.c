@@ -7,11 +7,36 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <pthread.h>
+#include <stdarg.h>
+
+#define BLK "\x1b[30m"
+#define RED "\x1b[31m"
+#define GRN "\x1b[32m"
+#define YEL "\x1b[33m"
+#define BLU "\x1b[34m"
+#define MAG "\x1b[35m"
+#define CYN "\x1b[36m"
+#define WHT "\x1b[37m"
+
+#define RST "\x1b[0m"
 
 #define FILE_SAMPLE_SIZE 4096
 #define BINARY_THRESHOLD 0.30
-
 #define SPAN_SIZE 64
+
+pthread_mutex_t threadMutex;
+pthread_mutex_t printfMutex;
+pthread_cond_t threadWorkerCond;
+pthread_cond_t threadMainCond;
+
+size_t numThreads = 1;
+bool *busyThreads;
+
+typedef struct ThreadContext {
+    int id;
+    char *term;
+} ThreadContext;
 
 typedef struct Span {
     char span[SPAN_SIZE];
@@ -27,7 +52,21 @@ typedef struct Queue {
     Node *head;
     Node *tail;
     int size;
+    char *term;
+    pthread_mutex_t mutex;
 } Queue;
+
+ThreadContext *createThreadContext() {
+    ThreadContext *newThreadContext = malloc(sizeof(ThreadContext));
+    newThreadContext->id = 0;
+    newThreadContext->term = NULL;
+    return newThreadContext;
+}
+
+void freeThreadContext(ThreadContext *threadContext) {
+    free(threadContext->term);
+    free(threadContext);
+}
 
 Node *createNode(const char *path) {
     Node *newNode = malloc(sizeof(Node));
@@ -47,38 +86,54 @@ Queue *createQueue() {
     newQueue->head = NULL;
     newQueue->tail = NULL;
     newQueue->size = 0;
+    pthread_mutex_init(&newQueue->mutex, NULL);
     return newQueue;
 }
 
 void freeQueue(Queue *queue) {
     if (queue == NULL) return;
 
+    pthread_mutex_lock(&queue->mutex);
+
     while(queue->head != NULL) {
         Node *tmp = queue->head;
         queue->head = tmp->next;
-        free(tmp);
+        freeNode(tmp);
     }
+
+    pthread_mutex_unlock(&queue->mutex);
+    pthread_mutex_destroy(&queue->mutex);
 
     free(queue);
 }
 
 void enqueue(Queue *queue, const char* path) {
+    pthread_mutex_lock(&queue->mutex);
+
     Node *newNode = createNode(path);
 
     if (queue->head == NULL) {
         queue->head = newNode;
         queue->tail = newNode;
         queue->size++;
+        pthread_mutex_unlock(&queue->mutex);
         return;
     }
 
     queue->tail->next = newNode;
     queue->tail = newNode;
     queue->size++;
+
+    pthread_mutex_unlock(&queue->mutex);
 }
 
 char* dequeue(Queue *queue) {
-    if (queue->head == NULL) return NULL;
+    pthread_mutex_lock(&queue->mutex);
+
+    if (queue->head == NULL) {
+        pthread_mutex_unlock(&queue->mutex);
+        return NULL;
+    }
 
     Node *head = queue->head;
     char *data = strdup(head->path);
@@ -86,16 +141,26 @@ char* dequeue(Queue *queue) {
     queue->size--;
 
     freeNode(head);
+    pthread_mutex_unlock(&queue->mutex);
 
     return data;
 }
 
-bool isEmpty(Queue *queue) {
-    return queue->size == 0;
-}
-
 Queue *gDirQueue;
 Queue *gFileQueue;
+
+void safePrintf(const char *format, ...) {
+    pthread_mutex_lock(&printfMutex);
+
+    va_list args;
+    va_start(args, format);
+
+    vprintf(format, args);
+    va_end(args);
+    fflush(stdout);
+
+    pthread_mutex_unlock(&printfMutex);
+}
 
 void dispatchPath(const char *path) {
     struct stat fileStat;
@@ -129,13 +194,13 @@ void processDir(const char *path) {
 
             dispatchPath(entryPath);
         }
+
+
+        closedir(dir);
     }
-    closedir(dir);
 }
 
 int isTextFile(const char *filename) {
-    struct stat fileStat;
-
     FILE *f = fopen(filename, "rb");
     if (!f) return -1;
 
@@ -202,32 +267,69 @@ void processFile(const char *term, const char *path) {
     fclose(file);
 
     if (spanPos) {
-        printf("%s\n", path);
+        pthread_mutex_lock(&printfMutex);
+        printf(BLU"%s\n"RST, path);
         for(int i = 0; i < spanPos; i++) {
-            printf("%d: %s\n", spans[i].line, spans[i].span);
+            printf(YEL"%d"RST": %s\n", spans[i].line, spans[i].span);
         }
         printf("\n");
+        pthread_mutex_unlock(&printfMutex);
     }
 
     free(spans);
     free(line);
 }
 
-void work(const char *term) {
+int work(const char *term, int id) {
+    int count = 0;
+
     // Process the files first
-    while(!isEmpty(gFileQueue) || !isEmpty(gDirQueue)) {
-        while(!isEmpty(gFileQueue)) {
-            char *filePath = dequeue(gFileQueue);
-            processFile(term, filePath);
-            free(filePath);
+    char *filePath;
+    while((filePath = dequeue(gFileQueue)) != NULL) {
+        processFile(term, filePath);
+        free(filePath);
+        count++;
+    }
+
+    char *dirPath;
+    if((dirPath = dequeue(gDirQueue)) != NULL) {
+        processDir(dirPath);
+        free(dirPath);
+        count++;
+    }
+
+    return count;
+}
+
+void *workerFunction(void *arg) {
+    ThreadContext *context = (ThreadContext*)arg;
+    int totalProcessedEntriesCount = 0;
+
+    while(1) {
+        int processedEntriesCount = work(context->term, context->id);
+        totalProcessedEntriesCount += processedEntriesCount;
+
+        pthread_mutex_lock(&threadMutex);
+
+        if (processedEntriesCount == 0) {
+            busyThreads[context->id] = false;
         }
 
-        if(!isEmpty(gDirQueue)) {
-            char *dirPath = dequeue(gDirQueue);
-            processDir(dirPath);
-            free(dirPath);
+        bool hasBusyThreads = false;
+        for (int i = 0; i < numThreads; i++) {
+            if (busyThreads[i]) hasBusyThreads = true;
         }
+
+        if (!hasBusyThreads) {
+            pthread_mutex_unlock(&threadMutex);
+            break;
+        }
+
+        pthread_mutex_unlock(&threadMutex);
     }
+
+    freeThreadContext(context);
+    return NULL;
 }
 
 void help() {
@@ -258,10 +360,43 @@ int main(int argc, char** argv) {
     parseInput(argc, argv, &term, &path);
 
     dispatchPath(path);
-    work(term);
+
+    long numProcs = sysconf(_SC_NPROCESSORS_ONLN);
+    if (numProcs < 1) {
+        numThreads = 1;
+    } else {
+        numThreads = numProcs;
+    }
+
+    pthread_t threads[numThreads];
+
+    pthread_mutex_init(&threadMutex, NULL);
+    pthread_mutex_init(&printfMutex, NULL);
+    pthread_cond_init(&threadWorkerCond, NULL);
+    pthread_cond_init(&threadMainCond, NULL);
+
+    busyThreads = malloc(numThreads * sizeof(bool));
+
+    for (int i = 0; i < numThreads; i++) {
+        ThreadContext *threadContext = createThreadContext();
+        threadContext->id = i;
+        threadContext->term = strdup(term);
+        busyThreads[i] = true;
+
+        pthread_create(&threads[i], NULL, workerFunction, threadContext);
+    }
+
+    for (int i = 0; i < numThreads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    pthread_mutex_destroy(&threadMutex);
+    pthread_cond_destroy(&threadMainCond);
+    pthread_cond_destroy(&threadWorkerCond);
 
     free(path);
     free(term);
+    free(busyThreads);
     freeQueue(gDirQueue);
     freeQueue(gFileQueue);
     return EXIT_SUCCESS;
