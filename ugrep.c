@@ -273,6 +273,7 @@ void processFile(const char *term, const char *path) {
             printf(YEL"%d"RST": %s\n", spans[i].line, spans[i].span);
         }
         printf("\n");
+        fflush(stdout);
         pthread_mutex_unlock(&printfMutex);
     }
 
@@ -310,14 +311,15 @@ void *workerFunction(void *arg) {
         totalProcessedEntriesCount += processedEntriesCount;
 
         pthread_mutex_lock(&threadMutex);
-
-        if (processedEntriesCount == 0) {
-            busyThreads[context->id] = false;
-        }
+        
+        busyThreads[context->id] = processedEntriesCount != 0;
 
         bool hasBusyThreads = false;
         for (int i = 0; i < numThreads; i++) {
-            if (busyThreads[i]) hasBusyThreads = true;
+            if (busyThreads[i]) {
+                hasBusyThreads = true;
+                break;
+            }
         }
 
         if (!hasBusyThreads) {
